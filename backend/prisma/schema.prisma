@@ -1,0 +1,148 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Состояния заявки. Активные (блокируют новую заявку на ресурс):
+// pending, executing, needs_attention — см. частичный уникальный индекс в миграции.
+enum RequestStatus {
+  pending // На согласовании
+  rejected // Отклонена
+  executing // Выполняется
+  completed // Завершена
+  needs_attention // Требует внимания
+}
+
+enum JobState {
+  active // обработчик должен её выполнять
+  attention // остановлена после трёх попыток, ждёт ручного повтора
+  done // результат записан
+}
+
+model Space {
+  id          String           @id
+  name        String
+  memberships Membership[]
+  resources   Resource[]
+  requests    RenewalRequest[]
+
+  @@map("spaces")
+}
+
+model User {
+  id           String           @id @default(uuid())
+  email        String           @unique
+  name         String
+  passwordHash String           @map("password_hash")
+  memberships  Membership[]
+  sessions     Session[]
+  created      RenewalRequest[] @relation("creator")
+  decided      RenewalRequest[] @relation("decider")
+  events       RequestEvent[]
+
+  @@map("users")
+}
+
+// Права пользователя внутри конкретного пространства.
+// Нет строки — нет доступа к пространству вообще.
+model Membership {
+  userId      String  @map("user_id")
+  spaceId     String  @map("space_id")
+  canInitiate Boolean @default(false) @map("can_initiate")
+  canApprove  Boolean @default(false) @map("can_approve")
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  space       Space   @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+
+  @@id([userId, spaceId])
+  @@map("memberships")
+}
+
+// В базе лежит только SHA-256 от токена; сам токен есть только в cookie.
+model Session {
+  tokenHash String   @id @map("token_hash")
+  userId    String   @map("user_id")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model Resource {
+  id         String           @id
+  spaceId    String           @map("space_id")
+  name       String
+  expiresOn  DateTime         @map("expires_on") @db.Date // календарная дата без времени
+  priceMinor Int              @map("price_minor") // копейки
+  currency   String           @default("RUB")
+  space      Space            @relation(fields: [spaceId], references: [id])
+  requests   RenewalRequest[]
+
+  @@index([spaceId])
+  @@map("resources")
+}
+
+model RenewalRequest {
+  // id заявки одновременно служит ключом идемпотентности у провайдера
+  id                  String         @id @default(uuid())
+  resourceId          String         @map("resource_id")
+  spaceId             String         @map("space_id")
+  status              RequestStatus  @default(pending)
+  createdById         String         @map("created_by_id")
+  decidedById         String?        @map("decided_by_id")
+  // снимок ресурса на момент создания
+  amountMinor         Int            @map("amount_minor")
+  currency            String
+  oldExpiresOn        DateTime       @map("old_expires_on") @db.Date
+  newExpiresOn        DateTime       @map("new_expires_on") @db.Date
+  providerOperationId String?        @map("provider_operation_id")
+  lastError           String?        @map("last_error")
+  createdAt           DateTime       @default(now()) @map("created_at")
+  updatedAt           DateTime       @updatedAt @map("updated_at")
+  resource            Resource       @relation(fields: [resourceId], references: [id])
+  space               Space          @relation(fields: [spaceId], references: [id])
+  createdBy           User           @relation("creator", fields: [createdById], references: [id])
+  decidedBy           User?          @relation("decider", fields: [decidedById], references: [id])
+  events              RequestEvent[]
+  job                 DispatchJob?
+
+  @@index([spaceId, createdAt])
+  @@index([resourceId, createdAt])
+  @@map("renewal_requests")
+}
+
+// История: кто, когда, какой переход. actorId = null — действие системы (обработчика).
+model RequestEvent {
+  id         Int            @id @default(autoincrement())
+  requestId  String         @map("request_id")
+  actorId    String?        @map("actor_id")
+  fromStatus RequestStatus? @map("from_status")
+  toStatus   RequestStatus  @map("to_status")
+  note       String?
+  createdAt  DateTime       @default(now()) @map("created_at")
+  request    RenewalRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  actor      User?          @relation(fields: [actorId], references: [id])
+
+  @@index([requestId, id])
+  @@map("request_events")
+}
+
+// Задача отправки провайдеру (transactional outbox).
+// Первичный ключ = id заявки, поэтому двух задач на одну заявку быть не может.
+model DispatchJob {
+  requestId    String         @id @map("request_id")
+  state        JobState       @default(active)
+  postAttempts Int            @default(0) @map("post_attempts") // считаются только POST
+  nextRunAt    DateTime       @default(now()) @map("next_run_at")
+  lockedUntil  DateTime?      @map("locked_until")
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+  request      RenewalRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([state, nextRunAt])
+  @@map("dispatch_jobs")
+}
